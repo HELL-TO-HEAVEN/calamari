@@ -1,17 +1,46 @@
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+# Workaround to install python packages again, because sometimes they are not found
 before_script:
   - set -e
   - virtualenv -p python3 venv
   - source venv/bin/activate
   - pip install -r requirements.txt
+  - pip install .[tf_cpu]
   - python setup.py install
 
 cache:
   paths:
+    - .cache/pip
     - venv
     - calamari_models
+  policy: pull
 
 stages:
+  - install_dependencies
   - test
+
+install_dependencies:
+  stage: install_dependencies
+  cache:
+    paths:
+      - .cache/pip
+      - venv
+      - calamari_models
+    policy: pull-push
+  before_script:
+    - set -e
+    - rm -rf venv
+    - rm -rf calamari_models
+  script:
+    - set -e
+    - virtualenv -p python3 venv
+    - source venv/bin/activate
+    - pip install -r requirements.txt
+    - pip install .[tf_cpu]
+    - python setup.py install
+    - wget -q -O - https://github.com/Calamari-OCR/calamari_models/archive/1.0.tar.gz | tar xz && mv calamari_models-1.0 calamari_models
 
 
 # General training with and without validation or data augmentation
@@ -59,14 +88,12 @@ test-cpu-cross-fold-train-preload:
   stage: test
   script:
     - set -e
-    - git clone --depth 1 https://github.com/Calamari-OCR/calamari_models.git || true
     - calamari-cross-fold-train --weights calamari_models/antiqua_modern/0.ckpt.json --files calamari_ocr/test/data/uw3_50lines/train/*.png --n_folds 3 --best_models_dir tmp_best_models --max_iters 10
 
 test-cpu-cross-fold-train-preload5:
   stage: test
   script:
     - set -e
-    - git clone --depth 1 https://github.com/Calamari-OCR/calamari_models.git || true
     - calamari-cross-fold-train --weights calamari_models/antiqua_modern/0.ckpt.json calamari_models/antiqua_modern/1.ckpt.json calamari_models/antiqua_modern/2.ckpt.json calamari_models/antiqua_modern/3.ckpt.json calamari_models/antiqua_modern/4.ckpt.json --files calamari_ocr/test/data/uw3_50lines/train/*.png --n_folds 5 --best_models_dir tmp_best_models --max_iters 10
 
 
@@ -76,13 +103,26 @@ test-cpu-predict-and-eval-with-voting:
   stage: test
   script:
     - set -e
-    - git clone --depth 1 https://github.com/Calamari-OCR/calamari_models.git || true
     - calamari-predict --files calamari_ocr/test/data/uw3_50lines/test/*.png --checkpoint calamari_models/antiqua_modern/0.ckpt.json
     - calamari-eval --gt calamari_ocr/test/data/uw3_50lines/test/*.gt.txt
     - calamari-eval --gt calamari_ocr/test/data/uw3_50lines/test/*.gt.txt --skip_empty_gt
     - calamari-predict --files calamari_ocr/test/data/uw3_50lines/test/*.png --checkpoint calamari_models/antiqua_modern/*.ckpt.json
     - calamari-eval --gt calamari_ocr/test/data/uw3_50lines/test/*.gt.txt --n_worst_lines 10 --xlsx_output text.xlsx
 
+
+# loading pretrained model
+
+test-cpu-pretrained:
+  stage: test
+  script:
+    - set -e
+    - calamari-train --weights calamari_models/antiqua_historical/0.ckpt.json --files calamari_ocr/test/data/uw3_50lines/train/*.png --max_iters 10
+
+test-cpu-pretrained-keep-loaded-codec:
+  stage: test
+  script:
+    - set -e
+    - calamari-train --weights calamari_models/antiqua_historical/0.ckpt.json --files calamari_ocr/test/data/uw3_50lines/train/*.png --max_iters 10 --keep_loaded_codec
 
 # on-the-fly data loading
 
@@ -117,7 +157,6 @@ test-cpu-predict-and-eval-with-voting-extended-prediction-data-avg-conf:
   stage: test
   script:
     - set -e
-    - git clone --depth 1 https://github.com/Calamari-OCR/calamari_models.git || true
     - calamari-predict --extended_prediction_data --files calamari_ocr/test/data/uw3_50lines/test/*.png --checkpoint calamari_models/antiqua_modern/0.ckpt.json
     - calamari-eval --gt calamari_ocr/test/data/uw3_50lines/test/*.gt.txt
     - python calamari_ocr/scripts/compute_average_prediction_confidence.py --pred calamari_ocr/test/data/uw3_50lines/test/*.json
@@ -153,6 +192,16 @@ test-cpu-train-on-page-xml:
       --files calamari_ocr/test/data/avicanon_pagexml/006.nrm.png calamari_ocr/test/data/avicanon_pagexml/007.nrm.png
       --validation calamari_ocr/test/data/avicanon_pagexml/008.nrm.png --validation_dataset PAGEXML
       --dataset PAGEXML --display 1.01 --num_threads 1 --early_stopping_frequency 5 --max_iter 10
+    - >
+      calamari-cross-fold-train --train_data_on_the_fly --validation_data_on_the_fly --n_augmentation 5
+      --files calamari_ocr/test/data/avicanon_pagexml/006.nrm.png calamari_ocr/test/data/avicanon_pagexml/007.nrm.png
+      --dataset PAGEXML --display 1.01
+      --n_folds 3 --best_models_dir tmp_best_models --max_iters 10
+    - >
+      calamari-cross-fold-train --train_data_on_the_fly --validation_data_on_the_fly --n_augmentation 5
+      --files calamari_ocr/test/data/avicanon_pagexml/006.nrm.png calamari_ocr/test/data/avicanon_pagexml/007.nrm.png
+      --dataset PAGEXML --display 1.01
+      --n_folds 3 --best_models_dir tmp_best_models --max_iters 10 --dataset_pad 3 0
 
 test-cpu-train-on-page-xml-validation-on-files:
   stage: test
@@ -168,9 +217,9 @@ test-cpu-predict-and-eval-page-xml:
   stage: test
   script:
     - set -e
-    - git clone --depth 1 https://github.com/Calamari-OCR/calamari_models.git || true
     - calamari-predict --files calamari_ocr/test/data/avicanon_pagexml/009.nrm.png --checkpoint calamari_models/antiqua_modern/0.ckpt.json --dataset PAGEXML
     - calamari-eval --gt calamari_ocr/test/data/avicanon_pagexml/009.xml --dataset PAGEXML --pred_ext .pred.xml
+    - calamari-predict --files calamari_ocr/test/data/avicanon_pagexml/009.nrm.png --checkpoint calamari_models/antiqua_modern/0.ckpt.json --dataset PAGEXML --dataset_pad 3 3
 
 
 # HDF5
@@ -190,7 +239,6 @@ test-cpu-predict-and-eval-hdf5:
   stage: test
   script:
     - set -e
-    - git clone --depth 1 https://github.com/Calamari-OCR/calamari_models.git || true
     - calamari-predict --files calamari_ocr/test/data/uw3_50lines/uw3-50lines.h5 --checkpoint calamari_models/antiqua_modern/0.ckpt.json --dataset HDF5
     - calamari-eval --gt calamari_ocr/test/data/uw3_50lines/uw3-50lines.h5 --dataset HDF5 --pred_ext .pred.h5 --n_worst_lines 100
 
@@ -221,8 +269,17 @@ test-cpu-predict-and-eval-abbyy-xml:
   stage: test
   script:
     - set -e
-    - git clone --depth 1 https://github.com/Calamari-OCR/calamari_models.git || true
     - calamari-predict --files calamari_ocr/test/data/hiltl_die_bank_des_verderbens_abbyyxml/*.jpg --checkpoint calamari_models/antiqua_modern/0.ckpt.json --dataset ABBYY
     - calamari-eval --gt calamari_ocr/test/data/hiltl_die_bank_des_verderbens_abbyyxml/*.abbyy.xml --dataset ABBYY --pred_ext .pred.abbyy.xml
 
+# NETWORK ARCHITECTURES
 
+test-cpu-network-architectures:
+  stage: test
+  script:
+    - set -
+    - calamari-train --files calamari_ocr/test/data/uw3_50lines/train/*.png --max_iters 10 --network 'cnn=40:3x3,pool=2x2,lstm=50,dropout=0.5'
+    - calamari-train --files calamari_ocr/test/data/uw3_50lines/train/*.png --max_iters 10 --network 'cnn=40:3x3,pool=2x2'
+    - calamari-train --files calamari_ocr/test/data/uw3_50lines/train/*.png --max_iters 10 --network 'cnn=40:3x3,pool=2x2,db=40:4:3x3'
+    - calamari-train --files calamari_ocr/test/data/uw3_50lines/train/*.png --max_iters 10 --network 'cnn=40:3x3,pool=2x2,db=40:4:3x3,tcnn=40:2x2'
+    - calamari-train --files calamari_ocr/test/data/uw3_50lines/train/*.png --max_iters 10 --network 'cnn=40:3x3,pool=2x2,db=40:4:3x3,tcnn=40:2x2,concat=1:-1'

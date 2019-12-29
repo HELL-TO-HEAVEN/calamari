@@ -8,8 +8,8 @@ from .dataset import DataSet, DataSetMode, DatasetGenerator
 
 
 class FileDataSetGenerator(DatasetGenerator):
-    def __init__(self, output_queue, mode: DataSetMode, samples, text_only, epochs, non_existing_as_empty):
-        super().__init__(output_queue, mode, samples, text_only, epochs)
+    def __init__(self, mp_context, output_queue, mode: DataSetMode, samples, non_existing_as_empty):
+        super().__init__(mp_context, output_queue, mode, samples)
         self._non_existing_as_empty = non_existing_as_empty
 
     def _load_sample(self, sample, text_only):
@@ -42,10 +42,14 @@ class FileDataSetGenerator(DatasetGenerator):
             else:
                 raise Exception("Image file at '{}' does not exist".format(image_path))
 
+        i = Image.open(image_path)
         try:
-            img = np.asarray(Image.open(image_path))
+            i.load()
+            img = np.array(i)
         except:
             return None
+        finally:
+            i.close()
 
         return img
 
@@ -80,10 +84,13 @@ class FileDataSet(DataSet):
         images = [] if images is None else images
         texts = [] if texts is None else texts
 
-        if mode == DataSetMode.PREDICT:
+        # when evaluating, only texts are set via --gt argument      --> need dummy [None] imgs
+        # when predicting, only imags are set via --files  argument  --> need dummy [None] texts
+        
+        if (mode == DataSetMode.PREDICT or mode == DataSetMode.PRED_AND_EVAL) and not texts:
             texts = [None] * len(images)
 
-        if mode == DataSetMode.EVAL:
+        if (mode == DataSetMode.EVAL or mode == DataSetMode.PRED_AND_EVAL) and not images: 
             images = [None] * len(texts)
 
         for image, text in zip(images, texts):
@@ -123,43 +130,5 @@ class FileDataSet(DataSet):
                 "id": img_bn if image else text_bn,
             })
 
-    def create_generator(self, output_queue, epochs, text_only):
-        return FileDataSetGenerator(output_queue, self.mode, self.samples(), text_only, epochs, self._non_existing_as_empty)
-
-    def _load_sample(self, sample, text_only):
-        if text_only:
-            return None, self._load_gt_txt(sample["text_path"])
-        else:
-            return self._load_line(sample["image_path"]), \
-                   self._load_gt_txt(sample["text_path"])
-
-    def _load_gt_txt(self, gt_txt_path):
-        if gt_txt_path is None:
-            return None
-
-        if not os.path.exists(gt_txt_path):
-            if self._non_existing_as_empty:
-                return ""
-            else:
-                raise Exception("Text file at '{}' does not exist".format(gt_txt_path))
-
-        with codecs.open(gt_txt_path, 'r', 'utf-8') as f:
-            return f.read()
-
-    def _load_line(self, image_path):
-        if image_path is None:
-            return None
-
-        if not os.path.exists(image_path):
-            if self._non_existing_as_empty:
-                return np.zeros((1, 1))
-            else:
-                raise Exception("Image file at '{}' does not exist".format(image_path))
-
-        try:
-            img = np.asarray(Image.open(image_path))
-        except:
-            return None
-
-        return img
-
+    def create_generator(self, mp_context, output_queue):
+        return FileDataSetGenerator(mp_context, output_queue, self.mode, self.samples(), self._non_existing_as_empty)

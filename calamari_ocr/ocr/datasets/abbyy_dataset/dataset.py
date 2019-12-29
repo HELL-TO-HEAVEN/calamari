@@ -11,8 +11,8 @@ from calamari_ocr.utils import split_all_ext
 
 
 class AbbyyDatasetGenerator(DatasetGenerator):
-    def __init__(self, output_queue, mode: DataSetMode, images, xml_files, text_only, epochs, non_existing_as_empty, skip_invalid, binary, remove_invalid):
-        super().__init__(output_queue, mode, zip(images, xml_files), text_only, epochs)
+    def __init__(self, mp_context, output_queue, mode: DataSetMode, images, xml_files, non_existing_as_empty, skip_invalid, binary, remove_invalid):
+        super().__init__(mp_context, output_queue, mode, list(zip(images, xml_files)))
         self._non_existing_as_empty = non_existing_as_empty
         self.skip_invalid = skip_invalid
         self.binary = binary
@@ -23,7 +23,7 @@ class AbbyyDatasetGenerator(DatasetGenerator):
 
         book = XMLReader([image_path], [xml_path], self.skip_invalid, self.remove_invalid).read()
 
-        if self.mode == DataSetMode.TRAIN or self.mode == DataSetMode.PREDICT:
+        if self.mode == DataSetMode.TRAIN or self.mode == DataSetMode.PREDICT or self.mode == DataSetMode.PRED_AND_EVAL:
             img = np.array(Image.open(image_path))
             if self.binary:
                 img = img > 0.9
@@ -35,14 +35,14 @@ class AbbyyDatasetGenerator(DatasetGenerator):
                 for f, fo in enumerate(line.formats):
                     text = None
                     cut_img = None
-                    if self.mode == DataSetMode.EVAL or self.mode == DataSetMode.TRAIN:
+                    if self.mode == DataSetMode.EVAL or self.mode == DataSetMode.TRAIN or self.mode == DataSetMode.PRED_AND_EVAL:
                         text = fo.text
 
                     if text_only:
                         yield cut_img, text
 
                     else:
-                        if self.mode == DataSetMode.TRAIN or self.mode == DataSetMode.PREDICT:
+                        if self.mode == DataSetMode.TRAIN or self.mode == DataSetMode.PREDICT or self.mode == DataSetMode.PRED_AND_EVAL:
                             ly, lx = img.shape
 
                             # Cut the Image
@@ -111,10 +111,10 @@ class AbbyyDataSet(DataSet):
         # an Abbyy dataset stores the prediction in one XML file
         sample["format"].text = sentence
 
-    def store(self):
+    def store(self, extension):
         for page in tqdm(self.book.pages, desc="Writing Abbyy files", total=len(self.book.pages)):
-            XMLWriter.write(page, split_all_ext(page.xmlFile)[0] + ".pred.abbyy.xml")
+            XMLWriter.write(page, split_all_ext(page.xmlFile)[0] + extension)
 
-    def create_generator(self, output_queue, epochs, text_only) -> DatasetGenerator:
-        return AbbyyDatasetGenerator(output_queue, self.mode, self.files, self.xmlfiles, text_only, epochs, self._non_existing_as_empty, self.skip_invalid, self.binary, self.remove_invalid)
+    def create_generator(self, mp_context, output_queue) -> DatasetGenerator:
+        return AbbyyDatasetGenerator(mp_context, output_queue, self.mode, self.files, self.xmlfiles, self._non_existing_as_empty, self.skip_invalid, self.binary, self.remove_invalid)
 

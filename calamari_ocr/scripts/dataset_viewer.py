@@ -1,10 +1,9 @@
 import matplotlib.pyplot as plt
 import argparse
 from calamari_ocr.ocr.datasets import create_dataset, DataSetType, DataSetMode
-from calamari_ocr.ocr.datasets.input_dataset import InputDataset
+from calamari_ocr.ocr.datasets.input_dataset import StreamingInputDataset
 from calamari_ocr import __version__
 from calamari_ocr.utils import glob_all, split_all_ext, keep_files_with_same_file_name
-import numpy as np
 from calamari_ocr.ocr.text_processing import text_processor_from_proto
 from calamari_ocr.ocr.data_processing import data_processor_from_proto
 from calamari_ocr.proto import DataPreprocessorParams, TextProcessorParams
@@ -12,6 +11,7 @@ from calamari_ocr.ocr.text_processing import \
     default_text_normalizer_params, default_text_regularizer_params
 import os
 from calamari_ocr.ocr.augmentation.data_augmenter import SimpleDataAugmenter
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -94,6 +94,7 @@ def main():
         DataSetMode.TRAIN,
         images=input_image_files,
         texts=gt_txt_files,
+        non_existing_as_empty=True,
     )
 
     if len(args.select) == 0:
@@ -106,33 +107,32 @@ def main():
 
     print("Found {} files in the dataset".format(len(dataset)))
 
-    input_dataset = InputDataset(dataset,
-                                 data_preprocessor,
-                                 text_preprocessor,
-                                 SimpleDataAugmenter(),
-                                 args.n_augmentations,
-                                 )
+    with StreamingInputDataset(dataset,
+                               data_preprocessor,
+                               text_preprocessor,
+                               SimpleDataAugmenter(),
+                               args.n_augmentations,
+                               ) as input_dataset:
+        f, ax = plt.subplots(args.n_rows, args.n_cols, sharey='all')
+        row, col = 0, 0
+        for i, (id, sample) in enumerate(zip(args.select, input_dataset.generator(args.processes))):
+            line, text, params = sample
+            if args.n_cols == 1:
+                ax[row].imshow(line.transpose())
+                ax[row].set_title("ID: {}\n{}".format(id, text))
+            else:
+                ax[row, col].imshow(line.transpose())
+                ax[row, col].set_title("ID: {}\n{}".format(id, text))
 
-    f, ax = plt.subplots(args.n_rows, args.n_cols, sharey='all')
-    row, col = 0, 0
-    for i, (id, sample) in enumerate(zip(args.select, input_dataset.generator(args.processes))):
-        line, text, params = sample
-        if args.n_cols == 1:
-            ax[row].imshow(line.transpose())
-            ax[row].set_title("ID: {}\n{}".format(id, text))
-        else:
-            ax[row, col].imshow(line.transpose())
-            ax[row, col].set_title("ID: {}\n{}".format(id, text))
+            row += 1
+            if row == args.n_rows:
+                row = 0
+                col += 1
 
-        row += 1
-        if row == args.n_rows:
-            row = 0
-            col += 1
-
-        if col == args.n_cols or i == len(samples) - 1:
-            plt.show()
-            f, ax = plt.subplots(args.n_rows, args.n_cols, sharey='all')
-            row, col = 0, 0
+            if col == args.n_cols or i == len(samples) - 1:
+                plt.show()
+                f, ax = plt.subplots(args.n_rows, args.n_cols, sharey='all')
+                row, col = 0, 0
 
 
 if __name__ == "__main__":

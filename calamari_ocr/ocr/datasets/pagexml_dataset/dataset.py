@@ -4,37 +4,50 @@ from PIL import Image
 from tqdm import tqdm
 from lxml import etree
 from skimage.draw import polygon
+from skimage.transform import rotate
 from typing import List
 
 from calamari_ocr.ocr.datasets import DataSet, DataSetMode, DatasetGenerator
-from calamari_ocr.utils import split_all_ext
+from calamari_ocr.utils import split_all_ext, filename
+
+import logging
+logger = logging.getLogger(__name__)
 
 
 class PageXMLDatasetGenerator(DatasetGenerator):
-    def __init__(self, output_queue, mode: DataSetMode, images, xml_files, text_only, epochs, non_existing_as_empty, text_index, skip_invalid):
-        super().__init__(output_queue, mode, zip(images, xml_files), text_only, epochs)
+    def __init__(self, mp_context, output_queue, mode: DataSetMode, images, xml_files, non_existing_as_empty, text_index, skip_invalid, args):
+        super().__init__(mp_context, output_queue, mode, list(zip(images, xml_files)))
         self._non_existing_as_empty = non_existing_as_empty
         self.text_index = text_index
         self.skip_invalid = skip_invalid
+        self.args = args
 
     def _load_sample(self, sample, text_only):
         loader = PageXMLDatasetLoader(self.mode, self._non_existing_as_empty, self.text_index, self.skip_invalid)
         image_path, xml_path = sample
 
         img = None
-        if self.mode == DataSetMode.PREDICT or self.mode == DataSetMode.TRAIN:
+        if self.mode == DataSetMode.PREDICT or self.mode == DataSetMode.TRAIN or self.mode == DataSetMode.PRED_AND_EVAL:
             img = np.array(Image.open(image_path))
 
         for sample in loader.load(image_path, xml_path):
             text = sample["text"]
+            orientation = sample["orientation"]
 
-            if not text_only and (self.mode == DataSetMode.PREDICT or self.mode == DataSetMode.TRAIN):
+            if not text_only and (self.mode == DataSetMode.PREDICT or self.mode == DataSetMode.TRAIN or self.mode == DataSetMode.PRED_AND_EVAL):
                 ly, lx = img.shape
 
                 line_img = PageXMLDataset.cutout(img, sample['coords'], lx / sample['img_width'])
 
+                # rotate by orientation angle in clockwise direction to correct present skew
+                # (skimage rotates in counter-clockwise direction)
+                if orientation and orientation % 360 != 0:
+                    line_img = rotate(line_img, orientation*-1, resize=True, mode='constant', cval=line_img.max(), preserve_range=True).astype(np.uint8)
+
                 # add padding as required from normal files
-                # img = np.pad(img, ((3, 3), (0, 0)), mode='constant', constant_values=img.max())
+                if self.args.get('pad', None):
+                    pad = self.args['pad']
+                    img = np.pad(img, pad, mode='constant', constant_values=img.max())
             else:
                 line_img = None
 
@@ -59,30 +72,41 @@ class PageXMLDatasetLoader:
         root = etree.parse(xml).getroot()
         self.root = root
 
-        if self.mode == DataSetMode.TRAIN or self.mode == DataSetMode.EVAL:
-            return self._samples_gt_from_book(root, img, skip_commented)
+        if self.mode == DataSetMode.TRAIN or self.mode == DataSetMode.EVAL or self.mode == DataSetMode.PRED_AND_EVAL:
+            return self._samples_gt_from_book(root, img, skip_commented, xml)
         else:
-            return self._samples_from_book(root, img)
+            return self._samples_from_book(root, img, xml)
 
-
-    def _samples_gt_from_book(self, root, img,
+    def _samples_gt_from_book(self, root, img, page_id,
                               skipcommented=True):
         ns = {"ns": root.nsmap[None]}
         imgfile = root.xpath('//ns:Page',
                              namespaces=ns)[0].attrib["imageFilename"]
-        if self.mode == DataSetMode.TRAIN and not img.endswith(imgfile):
-            raise Exception("Mapping of image file to xml file invalid: {} vs {}".format(img, imgfile))
+        if (self.mode == DataSetMode.TRAIN or self.mode == DataSetMode.PRED_AND_EVAL) and not split_all_ext(img)[0].endswith(split_all_ext(imgfile)[0]):
+            raise Exception("Mapping of image file to xml file invalid: {} vs {} (comparing basename {} vs {})".format(
+                img, imgfile, split_all_ext(img)[0], split_all_ext(imgfile)[0]))
 
         img_w = int(root.xpath('//ns:Page',
                                namespaces=ns)[0].attrib["imageWidth"])
-        tequivs = root.xpath('//ns:TextEquiv[@index="{}"]'.format(self.text_index),
-                             namespaces=ns)
-        for l in tequivs:
-            parat = l.getparent().attrib
+        textlines = root.xpath('//ns:TextLine', namespaces=ns)
+
+        for textline in textlines:
+            tequivs = textline.xpath('./ns:TextEquiv[@index="{}"]'.format(self.text_index),
+                                namespaces=ns)
+            if len(tequivs) > 1:
+                logger.warning("PageXML is invalid: TextLine includes TextEquivs with non unique ids")
+
+            parat = textline.attrib
             if skipcommented and "comments" in parat and parat["comments"]:
                 continue
 
-            text = l.xpath('./ns:Unicode', namespaces=ns).pop().text
+            if tequivs is not None and len(tequivs) > 0:
+                l = tequivs[0]
+                text = l.xpath('./ns:Unicode', namespaces=ns).pop().text
+            else:
+                l = None
+                text = None
+
             if not text:
                 if self.skip_invalid:
                     continue
@@ -91,36 +115,51 @@ class PageXMLDatasetLoader:
                 else:
                     raise Exception("Empty text field")
 
+            try:
+                orientation = float(textline.xpath('../@orientation', namespaces=ns).pop())
+            except (ValueError, IndexError):
+                orientation = 0
+
             yield {
+                'page_id': page_id,
                 'ns': ns,
-                "rtype": l.xpath('../../@type', namespaces=ns).pop(),
+                "rtype": textline.xpath('../@type', namespaces=ns).pop(),
                 'xml_element': l,
-                "imgfile": img,
-                "id": l.xpath('../@id', namespaces=ns).pop(),
+                "image_path": img,
+                "id": textline.xpath('./@id', namespaces=ns).pop(),
                 "text": text,
-                "coords": l.xpath('../ns:Coords/@points',
+                "coords": textline.xpath('./ns:Coords/@points',
                                   namespaces=ns).pop(),
+                "orientation": orientation,
                 "img_width": img_w
             }
 
-    def _samples_from_book(self, root, img):
+    def _samples_from_book(self, root, img, page_id):
         ns = {"ns": root.nsmap[None]}
         imgfile = root.xpath('//ns:Page',
                              namespaces=ns)[0].attrib["imageFilename"]
-        if not img.endswith(imgfile):
-            raise Exception("Mapping of image file to xml file invalid: {} vs {}".format(img, imgfile))
+        if not split_all_ext(img)[0].endswith(split_all_ext(imgfile)[0]):
+            raise Exception("Mapping of image file to xml file invalid: {} vs {} (comparing basename {} vs {})".format(
+                img, imgfile, split_all_ext(img)[0], split_all_ext(imgfile)[0]))
 
         img_w = int(root.xpath('//ns:Page',
                                namespaces=ns)[0].attrib["imageWidth"])
         for l in root.xpath('//ns:TextLine', namespaces=ns):
+            try:
+                orientation = float(l.xpath('../@orientation', namespaces=ns).pop())
+            except (ValueError, IndexError):
+                orientation = 0
+
             yield {
+                'page_id': page_id,
                 'ns': ns,
                 "rtype": l.xpath('../@type', namespaces=ns).pop(),
                 'xml_element': l,
-                "imgfile": img,
+                "image_path": img,
                 "id": l.xpath('./@id', namespaces=ns).pop(),
                 "coords": l.xpath('./ns:Coords/@points',
                                   namespaces=ns).pop(),
+                "orientation": orientation,
                 "img_width": img_w,
                 "text": None,
             }
@@ -159,7 +198,9 @@ class PageXMLDataset(DataSet):
             xmlfiles = []
 
         if args is None:
-            args = []
+            args = {}
+
+        self.args = args
 
         self.text_index = args.get('text_index', 0)
 
@@ -180,6 +221,9 @@ class PageXMLDataset(DataSet):
 
             self.pages.append(loader.root)
 
+        # store which pagexml was stored last, to check when a file is ready to be written during sequential prediction
+        self._last_page_id = None
+
     @staticmethod
     def cutout(pageimg, coordstring, scale=1, rect=False):
         coords = [p.split(",") for p in coordstring.split()]
@@ -197,25 +241,8 @@ class PageXMLDataset(DataSet):
         box[rr - offset[0], cc - offset[1]] = pageimg[rr, cc]
         return box
 
-    def _load_sample(self, sample, text_only):
-        image_path = sample["imgfile"]
-        text = sample["text"]
-        img = None
-
-        if text_only:
-            return img, text
-
-        if self.mode == DataSetMode.PREDICT or self.mode == DataSetMode.TRAIN:
-            img = np.array(Image.open(image_path))
-
-            ly, lx = img.shape
-            
-            img = PageXMLDataset.cutout(img, sample['coords'], lx / sample['img_width'])
-
-            # add padding as required from normal files
-            # img = np.pad(img, ((3, 3), (0, 0)), mode='constant', constant_values=img.max())
-
-        return img, text
+    def prepare_store(self):
+        self._last_page_id = None
 
     def store_text(self, sentence, sample, output_dir, extension):
         ns = sample['ns']
@@ -231,10 +258,32 @@ class PageXMLDataset(DataSet):
 
         u_xml.text = sentence
 
-    def store(self):
-        for xml, page in tqdm(zip(self.xmlfiles, self.pages), desc="Writing PageXML files", total=len(self.xmlfiles)):
-            with open(split_all_ext(xml)[0] + ".pred.xml", 'w') as f:
-                f.write(etree.tounicode(page.getroottree()))
+        # check if page can be stored, this requires that (standard in prediction) the pages are passed sequentially
+        if self._last_page_id != sample['page_id']:
+            if self._last_page_id:
+                self._store_page(extension, self._last_page_id)
+            self._last_page_id = sample['page_id']
 
-    def create_generator(self, output_queue, epochs, text_only) -> DatasetGenerator:
-        return PageXMLDatasetGenerator(output_queue, self.mode, self.files, self.xmlfiles, text_only, epochs, self._non_existing_as_empty, self.text_index, self.skip_invalid)
+    def store_extended_prediction(self, data, sample, output_dir, extension):
+        output_dir = os.path.join(output_dir, filename(sample['image_path']))
+        if not os.path.exists(output_dir):
+            os.mkdir(output_dir)
+
+        super().store_extended_prediction(data, sample, output_dir, extension)
+
+    def store(self, extension):
+        if self._last_page_id:
+            self._store_page(extension, self._last_page_id)
+            self._last_page_id = None
+        else:
+            for xml, page in tqdm(zip(self.xmlfiles, self.pages), desc="Writing PageXML files", total=len(self.xmlfiles)):
+                with open(split_all_ext(xml)[0] + extension, 'w') as f:
+                    f.write(etree.tounicode(page.getroottree()))
+
+    def _store_page(self, extension, page_id):
+        page = self.pages[self.xmlfiles.index(page_id)]
+        with open(split_all_ext(page_id)[0] + extension, 'w') as f:
+            f.write(etree.tounicode(page.getroottree()))
+
+    def create_generator(self, mp_context, output_queue) -> DatasetGenerator:
+        return PageXMLDatasetGenerator(mp_context, output_queue, self.mode, self.files, self.xmlfiles, self._non_existing_as_empty, self.text_index, self.skip_invalid, self.args)

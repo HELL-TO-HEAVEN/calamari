@@ -23,6 +23,8 @@ def parallel_map(f, d, _sentinel=None, desc="", processes=1, progress_bar=False,
     if processes <= 0:
         processes = os.cpu_count()
 
+    processes = min(processes, len(d))
+
     if processes == 1:
         if progress_bar:
             out = list(tqdm(map(f, d), desc=desc, total=len(d)))
@@ -63,11 +65,13 @@ def run(command, verbose=False):
         raise Exception("The command must be a list or tuple of commands and arguments")
 
     if verbose:
-        print("Excecuting: {}".format(" ".join(command)))
+        print("Executing: {}".format(" ".join(command)))
 
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, shell=False)
+    env = os.environ.copy()
+    env['PYTHONIOENCODING'] = 'utf-8'
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, shell=False, env=env)
     while True:
-        line = process.stdout.readline().decode("utf-8")
+        line = process.stdout.readline().decode('utf-8')
 
         # check if process has finished
         if process.poll() is not None:

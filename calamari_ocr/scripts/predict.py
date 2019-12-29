@@ -10,11 +10,34 @@ from calamari_ocr.utils.glob import glob_all
 from calamari_ocr.ocr.datasets import DataSetType, create_dataset, DataSetMode
 from calamari_ocr.ocr import MultiPredictor
 from calamari_ocr.ocr.voting import voter_from_proto
-from calamari_ocr.proto import VoterParams, Predictions
+from calamari_ocr.proto import VoterParams, Predictions, CTCDecoderParams
+
+
+def create_ctc_decoder_params(args):
+    params = CTCDecoderParams()
+    params.beam_width = args.beam_width
+    params.word_separator = ' '
+
+    if args.dictionary and len(args.dictionary) > 0:
+        dictionary = set()
+        print("Creating dictionary")
+        for path in glob_all(args.dictionary):
+            with open(path, 'r') as f:
+                dictionary = dictionary.union({word for word in f.read().split()})
+
+        params.dictionary[:] = dictionary
+        print("Dictionary with {} unique words successfully created.".format(len(dictionary)))
+    else:
+        args.dictionary = None
+
+    if args.dictionary:
+        print("USING A LANGUAGE MODEL IS CURRENTLY EXPERIMENTAL ONLY. NOTE: THE PREDICTION IS VERY SLOW!")
+        params.type = CTCDecoderParams.CTC_WORD_BEAM_SEARCH
+
+    return params
 
 
 def run(args):
-
     # check if loading a json file
     if len(args.files) == 1 and args.files[0].endswith("json"):
         import json
@@ -31,6 +54,11 @@ def run(args):
     args.checkpoint = [(cp if cp.endswith(".json") else cp + ".json") for cp in args.checkpoint]
     args.checkpoint = glob_all(args.checkpoint)
     args.checkpoint = [cp[:-5] for cp in args.checkpoint]
+
+    args.extension = args.extension if args.extension else DataSetType.pred_extension(args.dataset)
+
+    # create ctc decoder
+    ctc_decoder_params = create_ctc_decoder_params(args)
 
     # create voter
     voter_params = VoterParams()
@@ -50,7 +78,10 @@ def run(args):
         args.text_files,
         skip_invalid=True,
         remove_invalid=True,
-        args={'text_index': args.pagexml_text_index},
+        args={
+            'text_index': args.pagexml_text_index,
+            'pad': args.dataset_pad,
+        },
     )
 
     print("Found {} files in the dataset".format(len(dataset)))
@@ -58,11 +89,14 @@ def run(args):
         raise Exception("Empty dataset provided. Check your files argument (got {})!".format(args.files))
 
     # predict for all models
-    predictor = MultiPredictor(checkpoints=args.checkpoint, batch_size=args.batch_size, processes=args.processes)
+    predictor = MultiPredictor(checkpoints=args.checkpoint, batch_size=args.batch_size, processes=args.processes,
+                               ctc_decoder_params=ctc_decoder_params)
     do_prediction = predictor.predict_dataset(dataset, progress_bar=not args.no_progress_bars)
 
     avg_sentence_confidence = 0
     n_predictions = 0
+
+    dataset.prepare_store()
 
     # output the voted results to the appropriate files
     for result, sample in do_prediction:
@@ -81,7 +115,7 @@ def run(args):
 
         output_dir = args.output_dir
 
-        dataset.store_text(sentence, sample, output_dir=output_dir, extension=".pred.txt")
+        dataset.store_text(sentence, sample, output_dir=output_dir, extension=args.extension)
 
         if args.extended_prediction_data:
             ps = Predictions()
@@ -92,23 +126,24 @@ def run(args):
                 os.mkdir(output_dir)
 
             if args.extended_prediction_data_format == "pred":
-                with open(os.path.join(output_dir, sample['id'] + ".pred"), 'wb') as f:
-                    f.write(ps.SerializeToString())
+                data = ps.SerializeToString()
             elif args.extended_prediction_data_format == "json":
-                with open(os.path.join(output_dir, sample['id'] + ".json"), 'w') as f:
-                    # remove logits
-                    for prediction in ps.predictions:
-                        prediction.logits.rows = 0
-                        prediction.logits.cols = 0
-                        prediction.logits.data[:] = []
+                # remove logits
+                for prediction in ps.predictions:
+                    prediction.logits.rows = 0
+                    prediction.logits.cols = 0
+                    prediction.logits.data[:] = []
 
-                    f.write(MessageToJson(ps, including_default_value_fields=True))
+                data = MessageToJson(ps, including_default_value_fields=True)
             else:
                 raise Exception("Unknown prediction format.")
 
+
+            dataset.store_extended_prediction(data, sample, output_dir=output_dir, extension=args.extended_prediction_data_format)
+
     print("Average sentence confidence: {:.2%}".format(avg_sentence_confidence / n_predictions))
 
-    dataset.store()
+    dataset.store(args.extension)
     print("All files written")
 
 
@@ -122,6 +157,8 @@ def main():
     parser.add_argument("--text_files", nargs="+", default=None,
                         help="Optional list of additional text files. E.g. when updating Abbyy prediction, this parameter must be used for the xml files.")
     parser.add_argument("--dataset", type=DataSetType.from_string, choices=list(DataSetType), default=DataSetType.FILE)
+    parser.add_argument("--extension", type=str, default=None,
+                        help="Define the prediction extension. This parameter can be used to override ground truth files.")
     parser.add_argument("--checkpoint", type=str, nargs="+", default=[],
                         help="Path to the checkpoint without file extension")
     parser.add_argument("-j", "--processes", type=int, default=1,
@@ -142,8 +179,13 @@ def main():
                         help="Extension format: Either pred or json. Note that json will not print logits.")
     parser.add_argument("--no_progress_bars", action="store_true",
                         help="Do not show any progress bars")
+    parser.add_argument("--dictionary", nargs="+", default=[],
+                        help="List of text files that will be used to create a dictionary")
+    parser.add_argument("--beam_width", type=int, default=25,
+                        help='Number of beams when using the CTCWordBeamSearch decoder')
 
-    # PageXML extra args
+    # dataset extra args
+    parser.add_argument("--dataset_pad", default=None, nargs='+', type=int)
     parser.add_argument("--pagexml_text_index", default=1)
 
     args = parser.parse_args()

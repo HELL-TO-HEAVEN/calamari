@@ -3,16 +3,15 @@ import time
 from tqdm import tqdm
 
 import numpy as np
-
-from google.protobuf import json_format
+from typing import Generator, List
 
 from calamari_ocr.ocr.text_processing import text_processor_from_proto
 from calamari_ocr.ocr.data_processing import data_processor_from_proto
-from calamari_ocr.ocr.datasets import InputDataset, RawInputDataset, DataSetMode
+from calamari_ocr.ocr.datasets import InputDataset, StreamingInputDataset, RawInputDataset, RawDataSet
 from calamari_ocr.ocr import Codec, Checkpoint
-from calamari_ocr.ocr.backends import create_backend_from_proto
-from calamari_ocr.proto import CheckpointParams
+from calamari_ocr.ocr.backends import create_backend_from_checkpoint
 from calamari_ocr.utils.output_to_input_transformer import OutputToInputTransformer
+from contextlib import ExitStack
 
 
 class PredictionResult:
@@ -60,6 +59,7 @@ class Predictor:
                  batch_size=1, processes=1,
                  auto_update_checkpoints=True,
                  with_gt=False,
+                 ctc_decoder_params=None,
                  ):
         """ Predicting a dataset based on a trained model
 
@@ -86,6 +86,8 @@ class Predictor:
             Update old models automatically (this will change the checkpoint files)
         with_gt : bool, optional
             The prediction will also output the ground truth if available else None
+        ctc_decoder_params : optional
+            Parameters of the ctc decoder
         """
         self.network = network
         self.checkpoint = checkpoint
@@ -98,18 +100,20 @@ class Predictor:
                 raise Exception("Either a checkpoint or a network can be provided")
 
             ckpt = Checkpoint(checkpoint, auto_update=self.auto_update_checkpoints)
+            self.checkpoint = ckpt.ckpt_path
             checkpoint_params = ckpt.checkpoint
             self.model_params = checkpoint_params.model
             self.codec = codec if codec else Codec(self.model_params.codec.charset)
 
             self.network_params = self.model_params.network
-            backend = create_backend_from_proto(self.network_params, restore=self.checkpoint, processes=processes)
+            backend = create_backend_from_checkpoint(checkpoint_params=checkpoint_params, processes=processes)
             self.text_postproc = text_postproc if text_postproc else text_processor_from_proto(self.model_params.text_postprocessor, "post")
             self.data_preproc = data_preproc if data_preproc else data_processor_from_proto(self.model_params.data_preprocessor)
             self.network = backend.create_net(
-                dataset=None,
                 codec=self.codec,
-                restore=self.checkpoint, weights=None, graph_type="predict", batch_size=batch_size)
+                ctc_decoder_params=ctc_decoder_params,
+                checkpoint_to_load=ckpt,
+                graph_type="predict", batch_size=batch_size)
         elif network:
             self.codec = codec
             self.model_params = None
@@ -140,11 +144,29 @@ class Predictor:
         dict
             Dataset entry of the prediction result
         """
-        input_dataset = InputDataset(dataset, self.data_preproc if apply_preproc else None, self.text_postproc if apply_preproc else None)
-        prediction_results = self.predict_input_dataset(input_dataset, progress_bar)
+        if isinstance(dataset, RawDataSet):
+            input_dataset = StreamingInputDataset(dataset, self.data_preproc if apply_preproc else None, self.text_postproc if apply_preproc else None)
+        else:
+            input_dataset = RawInputDataset(dataset, self.data_preproc if apply_preproc else None, self.text_postproc if apply_preproc else None)
 
-        for prediction, sample in zip(prediction_results, dataset.samples()):
-            yield prediction, sample
+        with input_dataset:
+            prediction_results = self.predict_input_dataset(input_dataset, progress_bar)
+
+            for prediction, sample in zip(prediction_results, dataset.samples()):
+                yield prediction, sample
+
+    def predict_raw(self, images, progress_bar=True, batch_size=-1, apply_preproc=True, params=None):
+        batch_size = len(images) if batch_size < 0 else self.network.batch_size if batch_size == 0 else batch_size
+        if apply_preproc:
+            images, params = zip(*self.data_preproc.apply(images, progress_bar=progress_bar, processes=self.processes))
+
+        for i in range(0, len(images), batch_size):
+            input_images = images[i:i + batch_size]
+            input_params = params[i:i + batch_size]
+            for p, ip in zip(self.network.predict_raw(input_images), input_params):
+                yield PredictionResult(p.decoded, codec=self.codec, text_postproc=self.text_postproc,
+                                       out_to_in_trans=self.out_to_in_trans, data_proc_params=ip,
+                                       ground_truth=p.ground_truth)
 
     def predict_input_dataset(self, input_dataset: InputDataset, progress_bar=True):
         """ Predict raw data
@@ -162,13 +184,10 @@ class Predictor:
             A single PredictionResult
         """
 
-        self.network.set_input_dataset(input_dataset, self.codec)
-        self.network.reset_data()
-
         if progress_bar:
-            out = tqdm(self.network.prediction_step(), desc="Prediction", total=len(input_dataset))
+            out = tqdm(self.network.predict_dataset(input_dataset), desc="Prediction", total=len(input_dataset))
         else:
-            out = self.network.prediction_step()
+            out = self.network.predict_dataset(input_dataset)
 
         for p in out:
             yield PredictionResult(p.decoded, codec=self.codec, text_postproc=self.text_postproc,
@@ -177,7 +196,9 @@ class Predictor:
 
 
 class MultiPredictor:
-    def __init__(self, checkpoints=None, text_postproc=None, data_preproc=None, batch_size=1, processes=1):
+    def __init__(self, checkpoints=None, text_postproc=None, data_preproc=None, batch_size=1, processes=1,
+                 ctc_decoder_params=None,
+                 ):
         """Predict multiple models to use voting
 
         Parameters
@@ -192,6 +213,8 @@ class MultiPredictor:
             The number of files to process simultaneously by the DNN
         processes : int, optional
             The number of processes to use
+        ctc_decoder_params : optional
+            Parameters of the ctc decoder
         """
         checkpoints = checkpoints if checkpoints else []
         if len(checkpoints) == 0:
@@ -199,59 +222,61 @@ class MultiPredictor:
 
         self.processes = processes
         self.checkpoints = checkpoints
-        self.predictors = [Predictor(cp, batch_size=batch_size, text_postproc=text_postproc,
+        self.predictors = [Predictor(cp,
+                                     ctc_decoder_params=ctc_decoder_params,
+                                     batch_size=batch_size, text_postproc=text_postproc,
                                      data_preproc=data_preproc, processes=processes) for cp in checkpoints]
         self.batch_size = batch_size
 
         # check if all checkpoints share the same preprocessor
-        # then we only need to apply the preprocessing once and share the data accross the models
+        # then we only need to apply the preprocessing once and share the data across the models
         preproc_params = self.predictors[0].model_params.data_preprocessor
+        self.data_preproc = self.predictors[0].data_preproc
         self.same_preproc = all([preproc_params == p.model_params.data_preprocessor for p in self.predictors])
 
-    def predict_dataset(self, dataset, progress_bar=True):
-        start_time = time.time()
         # preprocessing step (if all share the same preprocessor)
         if not self.same_preproc:
             raise Exception('Different preprocessors are currently not allowed during prediction')
 
-        input_dataset = InputDataset(dataset, self.predictors[0].data_preproc, self.predictors[0].text_postproc, None,
-                                     processes=self.processes,
-                                     )
+    def predict_raw(self, images, params=None, progress_bar=True, apply_preproc=True) -> Generator[List[PredictionResult], None, None]:
+        if apply_preproc:
+            images, params = zip(*self.data_preproc.apply(images, progress_bar=progress_bar))
+        else:
+            if not params:
+                params = [None] * len(images)
 
-        def progress_bar_wrapper(l):
-            if progress_bar:
-                return tqdm(l, total=int(np.ceil(len(dataset) / self.batch_size)), desc="Prediction")
-            else:
-                return l
+        prediction = [predictor.predict_raw(images, progress_bar=progress_bar, apply_preproc=False, params=params) for predictor in self.predictors]
 
-        def batched_data_params():
-            batch = []
-            for data_idx, (image, _, params) in enumerate(input_dataset.generator(epochs=1)):
-                batch.append((data_idx, image, params))
-                if len(batch) == self.batch_size:
+        for result in zip(*prediction):
+            yield result
+
+    def predict_dataset(self, dataset, progress_bar=True):
+        start_time = time.time()
+        with StreamingInputDataset(dataset, self.predictors[0].data_preproc, self.predictors[0].text_postproc, None,
+                                   processes=self.processes,
+                                   ) as input_dataset:
+            def progress_bar_wrapper(l):
+                if progress_bar:
+                    return tqdm(l, total=int(np.ceil(len(dataset) / self.batch_size)), desc="Prediction")
+                else:
+                    return l
+
+            def batched_data_params():
+                batch = []
+                for data_idx, (image, _, params) in enumerate(input_dataset.generator(epochs=1)):
+                    batch.append((data_idx, image, params))
+                    if len(batch) == self.batch_size:
+                        yield batch
+                        batch = []
+
+                if len(batch) > 0:
                     yield batch
-                    batch = []
 
-            if len(batch) > 0:
-                yield batch
-
-        for batch in progress_bar_wrapper(batched_data_params()):
-            sample_ids, batch_images, batch_params = zip(*batch)
-            samples = [dataset.samples()[i] for i in sample_ids]
-            raw_dataset = [
-                RawInputDataset(DataSetMode.PREDICT,
-                                batch_images,
-                                [None] * len(batch_images),
-                                batch_params,
-                                None,
-                                None,
-                                ) for p in self.predictors]
-
-            # predict_raw returns list of prediction objects
-            prediction = [predictor.predict_input_dataset(ds, progress_bar=False)
-                          for ds, predictor in zip(raw_dataset, self.predictors)]
-
-            for result, sample in zip(zip(*prediction), samples):
-                yield result, sample
+            for batch in progress_bar_wrapper(batched_data_params()):
+                sample_ids, batch_images, batch_params = zip(*batch)
+                samples = [dataset.samples()[i] for i in sample_ids]
+                prediction = self.predict_raw(batch_images, params=batch_params, progress_bar=False, apply_preproc=False)
+                for result, sample in zip(prediction, samples):
+                    yield result, sample
 
         print("Prediction of {} models took {}s".format(len(self.predictors), time.time() - start_time))

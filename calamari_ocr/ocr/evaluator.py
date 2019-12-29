@@ -3,7 +3,7 @@ from edit_distance import edit_distance
 from calamari_ocr.ocr.text_processing import synchronize
 from calamari_ocr.ocr.text_processing import DefaultTextPreprocessor
 from calamari_ocr.utils import parallel_map, tqdm_wrapper
-from calamari_ocr.ocr.datasets import InputDataset
+from calamari_ocr.ocr.datasets import StreamingInputDataset
 from collections import namedtuple
 
 
@@ -53,7 +53,7 @@ class Evaluator:
         pred_dataset : Dataset
             the prediction dataset
         processes : int, optional
-            the processes to use for preprocesing and evaluation
+            the processes to use for preprocessing and evaluation
         progress_bar : bool, optional
             show a progress bar
 
@@ -69,17 +69,19 @@ class Evaluator:
         else:
             # gt_dataset.load_samples(progress_bar=progress_bar)
             # gt_data = self.text_preprocessor.apply(gt_dataset.text_samples(), progress_bar=progress_bar)
-            gt_input_dataset = InputDataset(gt_dataset, None, self.text_preprocessor, processes=processes)
-            gt_data = [txt for _, txt, _ in tqdm_wrapper(gt_input_dataset.generator(text_only=True),
-                                                         total=len(gt_dataset),
-                                                         progress_bar=progress_bar,
-                                                         )]
+            with StreamingInputDataset(gt_dataset, None, self.text_preprocessor, processes=processes) as gt_input_dataset:
+                gt_data = [txt for _, txt, _ in tqdm_wrapper(gt_input_dataset.generator(text_only=True),
+                                                             total=len(gt_dataset),
+                                                             progress_bar=progress_bar,
+                                                             desc="Loading GT",
+                                                             )]
 
-        pred_input_dataset = InputDataset(pred_dataset, None, self.text_preprocessor, processes=processes)
-        pred_data = [txt for _, txt, _ in tqdm_wrapper(pred_input_dataset.generator(text_only=True),
-                                                       total=len(pred_dataset),
-                                                       progress_bar=progress_bar,
-                                                       )]
+        with StreamingInputDataset(pred_dataset, None, self.text_preprocessor, processes=processes) as pred_input_dataset:
+            pred_data = [txt for _, txt, _ in tqdm_wrapper(pred_input_dataset.generator(text_only=True),
+                                                           total=len(pred_dataset),
+                                                           progress_bar=progress_bar,
+                                                           desc="Loading Prediction"
+                                                           )]
 
         return self.evaluate(gt_data=gt_data, pred_data=pred_data, processes=processes, progress_bar=progress_bar,
                              skip_empty_gt=self.skip_empty_gt)
@@ -192,7 +194,7 @@ class Evaluator:
         pred_data : Dataset
             the prediction dataset
         processes : int, optional
-            the processes to use for preprocesing and evaluation
+            the processes to use for preprocessing and evaluation
         progress_bar : bool, optional
             show a progress bar
         skip_empty_gt : bool

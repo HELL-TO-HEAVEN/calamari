@@ -2,6 +2,7 @@ from calamari_ocr.ocr.data_processing.center_normalizer import CenterNormalizer
 from calamari_ocr.ocr.data_processing.data_preprocessor import DataPreprocessor, NoopDataPreprocessor, MultiDataProcessor
 from calamari_ocr.ocr.data_processing.data_range_normalizer import DataRangeNormalizer
 from calamari_ocr.ocr.data_processing.final_preparation import FinalPreparation
+from calamari_ocr.ocr.data_processing.scale_to_height_processor import ScaleToHeightProcessor
 
 from calamari_ocr.ocr.data_processing.default_data_preprocessor import DefaultDataPreprocessor
 
@@ -9,6 +10,10 @@ from calamari_ocr.proto import DataPreprocessorParams
 
 
 def data_processor_from_proto(data_preprocessor_params):
+    if len(data_preprocessor_params.children) > 0 and data_preprocessor_params.type != DataPreprocessorParams.MULTI_NORMALIZER:
+        raise ValueError("Only a MULTI_NORMALIZER may have children, however got {}".format(
+            DataPreprocessorParams.Type.Name(data_preprocessor_params.type)))
+
     if data_preprocessor_params.type == DataPreprocessorParams.MULTI_NORMALIZER:
         return MultiDataProcessor(
             [data_processor_from_proto(c) for c in data_preprocessor_params.children]

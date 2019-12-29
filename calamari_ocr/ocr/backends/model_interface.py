@@ -1,13 +1,12 @@
 import numpy as np
 from abc import ABC, abstractmethod
 
-from calamari_ocr.proto import NetworkParams
-from .ctc_decoder.default_ctc_decoder import DefaultCTCDecoder
-from .ctc_decoder.fuzzy_ctc_decoder import FuzzyCTCDecoder
+from calamari_ocr.ocr.callbacks import TrainingCallback
+from .ctc_decoder.ctc_decoder import create_ctc_decoder, CTCDecoderParams
 from calamari_ocr.ocr.datasets import InputDataset
 from calamari_ocr.ocr import Codec
 
-from typing import Any, Generator
+from typing import Any, Generator, List
 
 
 class NetworkPredictionResult:
@@ -25,7 +24,8 @@ class NetworkPredictionResult:
 
 
 class ModelInterface(ABC):
-    def __init__(self, network_proto, graph_type, batch_size, input_dataset: InputDataset = None, codec: Codec = None, processes=1):
+    def __init__(self, network_proto, graph_type, ctc_decoder_params, batch_size, codec: Codec = None,
+                 processes=1):
         """ Interface for a neural net
 
         Interface above the actual DNN implementation to abstract training and prediction.
@@ -36,79 +36,44 @@ class ModelInterface(ABC):
             Parameters that define the network
         graph_type : {"train", "test", "deploy"}
             Type of the graph, depending on the type different parts must be added (e.g. the solver)
+        ctc_decoder_params :
+            Parameters that define the CTC decoder to use
         batch_size : int
             Number of examples to train/predict in parallel
         """
         self.network_proto = network_proto
+        self.input_channels = network_proto.channels if network_proto.channels > 0 else 1
         self.graph_type = graph_type
         self.batch_size = batch_size
-        self.input_dataset = input_dataset
         self.codec = codec
         self.processes = processes
 
-        self.ctc_decoder = {
-            NetworkParams.CTC_FUZZY: FuzzyCTCDecoder(),
-            NetworkParams.CTC_DEFAULT: DefaultCTCDecoder(),
-        }[network_proto.ctc]
+        self.ctc_decoder = create_ctc_decoder(codec, ctc_decoder_params if ctc_decoder_params else CTCDecoderParams())
 
     def output_to_input_position(self, x):
         return x
 
-    def set_input_dataset(self, input_dataset: InputDataset, codec: Codec):
-        """ Set the networks data generator
-
-        Parameters
-        ----------
-        data_generator : Generator[Tuple[np.array, np.array, Any], None, None]
-            List of all raw labels to be used for training
-        Returns
-        -------
-            None
-        """
-        self.input_dataset = input_dataset
-        self.codec = codec
-
-    def train_step(self):
-        """ Performs a training step of the model.
-        Returns
-        -------
-            None
-        """
-
-        return self.train()
-
-    def iters_per_epoch(self, batch_size):
-        size = len(self.input_dataset)
-        r = size % batch_size
-        n = size // batch_size
-        return n if r == 0 else n + 1
-
-    def predict_raw(self, x, len_x) -> Generator[NetworkPredictionResult, None, None]:
+    @abstractmethod
+    def train(self, dataset, validation_dataset, checkpoint_params, text_post_proc, progress_bar,
+              training_callback=TrainingCallback()):
         pass
 
-    def prediction_step(self) -> Generator[NetworkPredictionResult, None, None]:
-        return self.predict()
+    def predict_raw(self, x: List[np.array]) -> Generator[NetworkPredictionResult, None, None]:
+        for r in self.predict_raw_batch(*self.zero_padding(x)):
+            yield r
 
-    def reset_data(self):
-        """ Called if the data changed
-        """
-        pass
-
-    def prepare(self):
+    @abstractmethod
+    def predict_raw_batch(self, x: np.array, len_x: np.array) -> Generator[NetworkPredictionResult, None, None]:
         pass
 
     @abstractmethod
-    def train(self):
-        return []
-
-    @abstractmethod
-    def predict(self) -> Generator[NetworkPredictionResult, None, None]:
+    def predict_dataset(self, dataset) -> Generator[NetworkPredictionResult, None, None]:
         """ Predict the current data
 
         Parameters
         ----------
-        with_gt : bool
-            Also output the gt if available in the dataset
+        dataset : InputDataset
+            the input dataset
 
         Returns
         -------
@@ -118,46 +83,24 @@ class ModelInterface(ABC):
         --------
             set_data
         """
-        return []
-
-    @abstractmethod
-    def save_checkpoint(self, filepath):
-        """ Save the current network state to `filepath`
-
-        Parameters
-        ----------
-        filepath : str
-            Where to store the checkpoint
-        """
         pass
 
     @abstractmethod
-    def load_weights(self, filepath, restore_only_trainable=True):
+    def load_weights(self, filepath):
         """ Load the weights stored a the given `filepath`
 
         Parameters
         ----------
         filepath : str
             File to load
-        restore_only_trainable : bool
-            If False e.g. the solver state is loaded, which might not be desired.
         """
         pass
 
-    @abstractmethod
-    def realign_model_labels(self, indices_to_delete, indices_to_add):
-        """ Realign the output matrix to the given labels
+    def zero_padding(self, data):
+        len_x = [len(x) for x in data]
+        out = np.zeros((len(data), max(len_x), self.network_proto.features), dtype=np.uint8)
+        for i, x in enumerate(data):
+            out[i, 0:len(x)] = x
 
-        On a codec resize some output labels can be added or deleted.
-        Thus, the corresponding vectors in the output matrix of the DNN must be adapted accordingly.
-
-        Parameters
-        ----------
-        indices_to_delete : list of int
-            labels to be deleted
-        indices_to_add : list of int
-            labels to be added (usually at the end)
-
-        """
-        pass
+        return np.expand_dims(out, axis=-1), np.array(len_x, dtype=np.int32)
 

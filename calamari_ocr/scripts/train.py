@@ -37,8 +37,6 @@ def setup_train_args(parser, omit=None):
 
     parser.add_argument("--seed", type=int, default="0",
                         help="Seed for random operations. If negative or zero a 'random' seed is used")
-    parser.add_argument("--backend", type=str, default="tensorflow",
-                        help="The backend to use for the neural net computation. Currently supported only tensorflow")
     parser.add_argument("--network", type=str, default="cnn=40:3x3,pool=2x2,cnn=60:3x3,pool=2x2,lstm=200,dropout=0.5",
                         help="The network structure")
     parser.add_argument("--line_height", type=int, default=48,
@@ -59,6 +57,8 @@ def setup_train_args(parser, omit=None):
     parser.add_argument("--max_iters", type=int, default=1000000,
                         help="The number of iterations for training. "
                              "If using early stopping, this is the maximum number of iterations")
+    parser.add_argument("--early_stopping_at_accuracy", type=float, default=0,
+                        help="Stop training if the early stopping accuracy reaches this value")
     parser.add_argument("--stats_size", type=int, default=100,
                         help="Average this many iterations for computing an average loss, label error rate and "
                              "training time")
@@ -91,12 +91,12 @@ def setup_train_args(parser, omit=None):
                         help="Whitelist of characters that may not be removed on restoring a model. "
                              "For large datasets you can use this to skip the automatic codec computation "
                              "(see --no_auto_compute_codec)")
+    parser.add_argument("--keep_loaded_codec", action='store_true', default=False,
+                        help="Fully include the codec of the loaded model to the new codec")
 
     # clipping
-    parser.add_argument("--gradient_clipping_mode", type=str, default="AUTO",
-                        help="Clipping mode of gradients. Defaults to AUTO, possible values are AUTO, NONE, CONSTANT")
-    parser.add_argument("--gradient_clipping_const", type=float, default=0,
-                        help="Clipping constant of gradients in CONSTANT mode.")
+    parser.add_argument("--gradient_clipping_norm", type=float, default=5,
+                        help="Clipping constant of the norm of the gradients.")
 
     # early stopping
     if "validation" not in omit:
@@ -112,10 +112,11 @@ def setup_train_args(parser, omit=None):
                         help='Instead of preloading all data during the training, load the data on the fly. '
                              'This is slower, but might be required for limited RAM or large datasets')
 
-    parser.add_argument("--early_stopping_frequency", type=float, default=0.5,
+    parser.add_argument("--early_stopping_frequency", type=float, default=-1,
                         help="The frequency of early stopping. By default the checkpoint frequency uses the early "
-                             "stopping frequency. By default (value = 0.5) the early stopping frequency equates to a "
-                             "half epoch. If 0 < value <= 1 the frequency has the unit of an epoch (relative to "
+                             "stopping frequency. By default (negative value) the early stopping frequency is "
+                             "approximated as a half epoch time (if the batch size is 1). "
+                             "If 0 < value <= 1 the frequency has the unit of an epoch (relative to the "
                              "number of training data).")
     parser.add_argument("--early_stopping_nbest", type=int, default=5,
                         help="The number of models that must be worse than the current best model to stop")
@@ -134,14 +135,13 @@ def setup_train_args(parser, omit=None):
                              "behavior.")
 
     # backend specific params
-    parser.add_argument("--fuzzy_ctc_library_path", type=str, default="",
-                        help="The fuzzy ctc module is not included in the official tensorflow, you need to compile it "
-                             "yourself. The resulting library (.so) must be loaded explicitly to make the functions available "
-                             "to calamari")
     parser.add_argument("--num_inter_threads", type=int, default=0,
                         help="Tensorflow's session inter threads param")
     parser.add_argument("--num_intra_threads", type=int, default=0,
                         help="Tensorflow's session intra threads param")
+    parser.add_argument("--shuffle_buffer_size", type=int, default=1000,
+                        help="Number of examples in the shuffle buffer for training (default 1000). A higher number "
+                             "required more memory. If set to 0, the buffer size equates an epoch i.e. the full dataset")
 
     # text normalization/regularization
     parser.add_argument("--text_regularization", type=str, nargs="+", default=["extended"],
@@ -155,6 +155,46 @@ def setup_train_args(parser, omit=None):
     parser.add_argument("--text_generator_params", type=str, default=None)
     parser.add_argument("--line_generator_params", type=str, default=None)
 
+
+    # additional dataset args
+    parser.add_argument("--dataset_pad", default=None, nargs='+', type=int)
+    parser.add_argument("--pagexml_text_index", default=0)
+
+
+
+def create_train_dataset(args, dataset_args=None):
+    gt_extension = args.gt_extension if args.gt_extension is not None else DataSetType.gt_extension(args.dataset)
+
+    # Training dataset
+    print("Resolving input files")
+    input_image_files = sorted(glob_all(args.files))
+    if not args.text_files:
+        if gt_extension:
+            gt_txt_files = [split_all_ext(f)[0] + gt_extension for f in input_image_files]
+        else:
+            gt_txt_files = [None] * len(input_image_files)
+    else:
+        gt_txt_files = sorted(glob_all(args.text_files))
+        input_image_files, gt_txt_files = keep_files_with_same_file_name(input_image_files, gt_txt_files)
+        for img, gt in zip(input_image_files, gt_txt_files):
+            if split_all_ext(os.path.basename(img))[0] != split_all_ext(os.path.basename(gt))[0]:
+                raise Exception("Expected identical basenames of file: {} and {}".format(img, gt))
+
+    if len(set(gt_txt_files)) != len(gt_txt_files):
+        raise Exception("Some image are occurring more than once in the data set.")
+
+    dataset = create_dataset(
+        args.dataset,
+        DataSetMode.TRAIN,
+        images=input_image_files,
+        texts=gt_txt_files,
+        skip_invalid=not args.no_skip_invalid_gt,
+        args=dataset_args if dataset_args else {},
+    )
+    print("Found {} files in the dataset".format(len(dataset)))
+    return dataset
+
+
 def run(args):
 
     # check if loading a json file
@@ -163,7 +203,10 @@ def run(args):
         with open(args.files[0], 'r') as f:
             json_args = json.load(f)
             for key, value in json_args.items():
-                setattr(args, key, value)
+                if key == 'dataset' or key == 'validation_dataset':
+                    setattr(args, key, DataSetType.from_string(value))
+                else:
+                    setattr(args, key, value)
 
     # parse whitelist
     whitelist = args.whitelist
@@ -196,35 +239,12 @@ def run(args):
     dataset_args = {
         'line_generator_params': args.line_generator_params,
         'text_generator_params': args.text_generator_params,
+        'pad': args.dataset_pad,
+        'text_index': args.pagexml_text_index,
     }
 
     # Training dataset
-    print("Resolving input files")
-    input_image_files = sorted(glob_all(args.files))
-    if not args.text_files:
-        if args.gt_extension:
-            gt_txt_files = [split_all_ext(f)[0] + args.gt_extension for f in input_image_files]
-        else:
-            gt_txt_files = [None] * len(input_image_files)
-    else:
-        gt_txt_files = sorted(glob_all(args.text_files))
-        input_image_files, gt_txt_files = keep_files_with_same_file_name(input_image_files, gt_txt_files)
-        for img, gt in zip(input_image_files, gt_txt_files):
-            if split_all_ext(os.path.basename(img))[0] != split_all_ext(os.path.basename(gt))[0]:
-                raise Exception("Expected identical basenames of file: {} and {}".format(img, gt))
-
-    if len(set(gt_txt_files)) != len(gt_txt_files):
-        raise Exception("Some image are occurring more than once in the data set.")
-
-    dataset = create_dataset(
-        args.dataset,
-        DataSetMode.TRAIN,
-        images=input_image_files,
-        texts=gt_txt_files,
-        skip_invalid=not args.no_skip_invalid_gt,
-        args=dataset_args,
-    )
-    print("Found {} files in the dataset".format(len(dataset)))
+    dataset = create_train_dataset(args, dataset_args)
 
     # Validation dataset
     if args.validation:
@@ -267,6 +287,7 @@ def run(args):
     params.processes = args.num_threads
     params.data_aug_retrain_on_original = not args.only_train_on_augmented
 
+    params.early_stopping_at_acc = args.early_stopping_at_accuracy
     params.early_stopping_frequency = args.early_stopping_frequency
     params.early_stopping_nbest = args.early_stopping_nbest
     params.early_stopping_best_model_prefix = args.early_stopping_best_model_prefix
@@ -279,7 +300,7 @@ def run(args):
     params.model.data_preprocessor.type = DataPreprocessorParams.MULTI_NORMALIZER
     for preproc in args.data_preprocessing:
         pp = params.model.data_preprocessor.children.add()
-        pp.type = preproc
+        pp.type = DataPreprocessorParams.Type.Value(preproc) if isinstance(preproc, str) else preproc
         pp.line_height = args.line_height
         pp.pad = args.pad
 
@@ -316,11 +337,10 @@ def run(args):
     params.model.line_height = args.line_height
 
     network_params_from_definition_string(args.network, params.model.network)
-    params.model.network.clipping_mode = NetworkParams.ClippingMode.Value("CLIP_" + args.gradient_clipping_mode.upper())
-    params.model.network.clipping_constant = args.gradient_clipping_const
-    params.model.network.backend.fuzzy_ctc_library_path = args.fuzzy_ctc_library_path
+    params.model.network.clipping_norm = args.gradient_clipping_norm
     params.model.network.backend.num_inter_threads = args.num_inter_threads
     params.model.network.backend.num_intra_threads = args.num_intra_threads
+    params.model.network.backend.shuffle_buffer_size = args.shuffle_buffer_size
 
     # create the actual trainer
     trainer = Trainer(params,
@@ -330,6 +350,7 @@ def run(args):
                       n_augmentations=args.n_augmentations,
                       weights=args.weights,
                       codec_whitelist=whitelist,
+                      keep_loaded_codec=args.keep_loaded_codec,
                       preload_training=not args.train_data_on_the_fly,
                       preload_validation=not args.validation_data_on_the_fly,
                       )

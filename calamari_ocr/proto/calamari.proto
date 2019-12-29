@@ -20,6 +20,7 @@ message CheckpointParams {
     int32 current_stage = 24;                      // Current training progress: 0 standard, 1 retraining on non aug.
 
     // params for early stopping
+    float early_stopping_at_acc = 26;                   // Stop training if validation reaches this accuracy threshold
     float early_stopping_frequency = 15;                // How often to check on validation data
     int32 early_stopping_nbest = 16;                    // How many models must be worse to stop
     string early_stopping_best_model_prefix = 17;       // Prefix for the best model
@@ -53,6 +54,9 @@ message LayerParams {
         CONVOLUTIONAL = 0;
         MAX_POOLING = 1;
         LSTM = 2;
+        TRANSPOSED_CONVOLUTIONAL = 3;
+        DILATED_BLOCK = 4;
+        CONCAT = 5;
     }
 
     enum LSTMDirection {
@@ -66,10 +70,35 @@ message LayerParams {
     IntVec2D kernel_size = 3;
     IntVec2D stride = 4;
 
+    // dilated block
+    int32 dilated_depth = 8;
+
+    // concat
+    repeated int32 concat_indices = 9;
+
     // LSTM
     int32 hidden_nodes = 5;
     bool peepholes = 6;
     LSTMDirection lstm_direction = 7;
+}
+
+message CTCDecoderParams {
+    enum CTCDecoderType {
+        CTC_DEFAULT = 0;
+        CTC_TOKEN_PASSING = 1;
+        CTC_WORD_BEAM_SEARCH = 2;
+    }
+
+    CTCDecoderType type = 1;
+
+    int32 blank_index = 2;
+    float min_p_threshold = 3;
+
+    int32 beam_width = 4;
+
+    repeated string dictionary = 6;
+
+    string word_separator = 7;
 }
 
 message NetworkParams {
@@ -77,18 +106,6 @@ message NetworkParams {
         MOMENTUM_SOLVER = 0;
         ADAM_SOLVER = 1;
     }
-
-    enum CTCType {
-        CTC_DEFAULT = 0;
-        CTC_FUZZY = 1;
-    }
-
-    enum ClippingMode {
-        CLIP_AUTO = 0;
-        CLIP_NONE = 1;
-        CLIP_CONSTANT = 2;
-    }
-
 
     BackendParams backend = 8;
 
@@ -98,32 +115,22 @@ message NetworkParams {
     float momentum = 3;
     float dropout = 5;
 
+    int32 channels = 14;                    // e.g. 1: binary/gray, 3: color, or any other number (default 0 equiv 1)
     int32 features = 6;
     int32 classes = 7;
 
     bool ctc_merge_repeated = 9;
-    CTCType ctc = 10;
 
-    ClippingMode clipping_mode = 12;
-    float clipping_constant = 13;
+    float clipping_norm = 13;
 }
 
 // Backend data
 message BackendParams {
-    enum Type {
-        TENSORFLOW = 0;
-    }
-
-    Type type = 1;
-    bool cudnn = 2;
-    int32 random_seed = 3;
-
-
-    // additional backend params for
-    // - tensorflow
-    string fuzzy_ctc_library_path = 4;
-    int32 num_inter_threads = 5;
-    int32 num_intra_threads = 6;
+    bool cudnn = 1;
+    int32 random_seed = 2;
+    int32 shuffle_buffer_size = 3;      // upper limit for the shuffle buffer used during training, 0 means no limit
+    int32 num_inter_threads = 4;
+    int32 num_intra_threads = 5;
 }
 
 // Data required to run a model
